@@ -1,0 +1,9 @@
+*.txt
+checkpoints/*
+*/__pycache__/*
+*.log
+*.csv
+*.db
+NMRTrans-main/*
+saved_checkpoint/*
+torch
