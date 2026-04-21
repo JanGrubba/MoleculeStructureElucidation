@@ -390,6 +390,8 @@ def train_inverse(
     ema_ce = 1.0
     ema_rl = 1.0
     ema_alpha = 0.01  # smoothing factor
+    rl_start_step = max(500, tcfg.warmup_steps)
+    rl_ce_threshold = 10.0
 
     for epoch in range(start_epoch, tcfg.max_epochs):
         model.train()
@@ -428,20 +430,40 @@ def train_inverse(
                     logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1)
                 )
 
+            if not torch.isfinite(ce_loss):
+                print(
+                    f"  [Warn] Non-finite CE loss at step {global_step}; skipping batch"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             # ── Tanimoto REINFORCE loss (every N steps) ───────────────
             rl_loss_val = 0.0
-            use_rl = global_step % tcfg.tanimoto_interval == 0
+            use_rl = (
+                global_step >= rl_start_step
+                and global_step % tcfg.tanimoto_interval == 0
+                and ce_loss.item() < rl_ce_threshold
+            )
             if use_rl:
                 n_rl = min(tcfg.tanimoto_rl_samples, spec.size(0))
-                with torch.no_grad():
-                    generated = model.generate_greedy(
-                        spec[:n_rl],
-                        spec_mask[:n_rl],
-                        gf[:n_rl],
-                        formula_vec[:n_rl],
-                        bos_idx=vocab.bos_idx,
-                        eos_idx=vocab.eos_idx,
+                try:
+                    with torch.no_grad():
+                        generated = model.generate_greedy(
+                            spec[:n_rl],
+                            spec_mask[:n_rl],
+                            gf[:n_rl],
+                            formula_vec[:n_rl],
+                            bos_idx=vocab.bos_idx,
+                            eos_idx=vocab.eos_idx,
+                        )
+                except Exception as exc:
+                    print(
+                        f"  [Warn] RL generation skipped at step {global_step}: {exc}"
                     )
+                    loss = ce_loss
+                    use_rl = False
+
+            if use_rl:
                 # Compute Tanimoto rewards
                 rewards = []
                 valid_rl_indices = []

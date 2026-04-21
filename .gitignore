@@ -7,3 +7,5 @@ checkpoints/*
 NMRTrans-main/*
 saved_checkpoint/*
 torch
+*/logs/*
+logs/*

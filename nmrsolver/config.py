@@ -184,7 +184,7 @@ class TrainConfig:
     lr: float = 3e-4  # Learning rate. Min: 1e-6, Max: 1e-2.
     weight_decay: float = 1e-2  # L2 regularization strength. Min: 0.0, Max: 1.0.
     warmup_steps: int = 4000  # Steps to linearly increase LR. Min: 0, Max: 10,000+.
-    max_epochs: int = 2  # Maximum training epochs. Min: 1, Max: 1000+.
+    max_epochs: int = 5  # Maximum training epochs. Min: 1, Max: 1000+.
     grad_clip: float = 1.0  # Maximum gradient norm. Min: 0.0, Max: 10.0+.
     label_smoothing: float = 0.1  # Smoothing for target labels. Min: 0.0, Max: 0.2.
     val_fraction: float = 0.05  # Fraction of data for validation. Min: 0.0, Max: 0.5.
@@ -235,15 +235,6 @@ class TrainConfig:
     )
 
 
-def _suggest_head_count(trial: Any, name: str, d_model: int) -> int:
-    """Suggest an attention-head count from 1 up to d_model//8, only divisors of d_model."""
-    max_heads = max(1, d_model // 8)
-    head_choices = [h for h in range(1, max_heads + 1) if d_model % h == 0]
-    if not head_choices:
-        head_choices = [1]
-    return int(trial.suggest_categorical(name, head_choices))
-
-
 def suggest_model_config(trial: Any, base: ModelConfig | None = None) -> ModelConfig:
     """Build a `ModelConfig` from an Optuna trial."""
     base = base or ModelConfig()
@@ -256,17 +247,13 @@ def suggest_model_config(trial: Any, base: ModelConfig | None = None) -> ModelCo
         )
     )
 
-    max_heads = max(1, enc_d_model // 8)
-    head_choices = [h for h in range(1, max_heads + 1) if enc_d_model % h == 0]
-    if not head_choices:
-        head_choices = [1]
-    enc_nhead = int(trial.suggest_categorical("enc_nhead", head_choices))
+    # Keep the search space static across trials to avoid Optuna's dynamic
+    # categorical distribution error.
+    # All choices below divide every enc_d_model option above.
+    enc_nhead = int(trial.suggest_categorical("enc_nhead", [1, 2, 4, 8]))
     enc_layers = trial.suggest_int("enc_layers", 2, 8)
-    enc_dim_ff = int(
-        trial.suggest_categorical(
-            "enc_dim_ff", [enc_d_model, 2 * enc_d_model, 4 * enc_d_model]
-        )
-    )
+    enc_ff_mult = int(trial.suggest_categorical("enc_ff_mult", [1, 2, 4]))
+    enc_dim_ff = enc_d_model * enc_ff_mult
     enc_dropout = trial.suggest_float("enc_dropout", 0.0, 0.5)
     # dec_d_model = int(
     #     trial.suggest_categorical(
@@ -339,20 +326,20 @@ def suggest_train_config(trial: Any, base: TrainConfig | None = None) -> TrainCo
 
     return TrainConfig(
         batch_size=base.batch_size,
-        lr=trial.suggest_float("lr", 1e-6, 1e-2, log=True),
-        weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True),
-        warmup_steps=trial.suggest_int("warmup_steps", 0, 10000, step=250),
+        lr=trial.suggest_float("lr", 1e-5, 5e-4, log=True),
+        weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
+        warmup_steps=trial.suggest_int("warmup_steps", 500, 8000, step=250),
         max_epochs=base.max_epochs,
-        grad_clip=trial.suggest_float("grad_clip", 0.1, 10.0, log=True),
-        label_smoothing=trial.suggest_float("label_smoothing", 0.0, 0.2),
+        grad_clip=trial.suggest_float("grad_clip", 0.5, 5.0, log=True),
+        label_smoothing=trial.suggest_float("label_smoothing", 0.0, 0.1),
         val_fraction=trial.suggest_float("val_fraction", 0.01, 0.20),
         test_fraction=trial.suggest_float("test_fraction", 0.005, 0.10),
         seed=trial.suggest_int("seed", 1, 100000),
-        tanimoto_interval=trial.suggest_int("tanimoto_interval", 1, 25),
-        tanimoto_rl_samples=trial.suggest_int("tanimoto_rl_samples", 1, 16),
-        rl_tanimoto_weight=trial.suggest_float("rl_tanimoto_weight", 0.3, 1.0),
-        rl_token_weight=trial.suggest_float("rl_token_weight", 0.3, 1.0),
-        rl_scale_boost=trial.suggest_float("rl_scale_boost", 1.0, 10.0),
+        tanimoto_interval=trial.suggest_int("tanimoto_interval", 5, 25),
+        tanimoto_rl_samples=trial.suggest_int("tanimoto_rl_samples", 1, 8),
+        rl_tanimoto_weight=trial.suggest_float("rl_tanimoto_weight", 0.2, 0.8),
+        rl_token_weight=trial.suggest_float("rl_token_weight", 0.2, 0.8),
+        rl_scale_boost=trial.suggest_float("rl_scale_boost", 0.5, 3.0),
         best_ckpt_tanimoto_weight=best_ckpt_tanimoto_weight,
         best_ckpt_token_acc_weight=best_ckpt_token_acc_weight,
         best_ckpt_validity_weight=best_ckpt_validity_weight,
@@ -361,8 +348,8 @@ def suggest_train_config(trial: Any, base: TrainConfig | None = None) -> TrainCo
         ),
         beam_size=trial.suggest_int("beam_size", 1, 32),
         top_k_output=base.top_k_output,
-        ppm_noise_std=trial.suggest_float("ppm_noise_std", 0.0, 5.0),
-        mult_drop_prob=trial.suggest_float("mult_drop_prob", 0.0, 0.5),
-        j_noise_std=trial.suggest_float("j_noise_std", 0.0, 5.0),
-        peak_drop_prob=trial.suggest_float("peak_drop_prob", 0.0, 0.2),
+        ppm_noise_std=trial.suggest_float("ppm_noise_std", 0.0, 1.0),
+        mult_drop_prob=trial.suggest_float("mult_drop_prob", 0.0, 0.2),
+        j_noise_std=trial.suggest_float("j_noise_std", 0.0, 2.0),
+        peak_drop_prob=trial.suggest_float("peak_drop_prob", 0.0, 0.08),
     )
