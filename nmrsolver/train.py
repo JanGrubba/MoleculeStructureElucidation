@@ -17,6 +17,7 @@ import importlib
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -144,6 +145,92 @@ def load_checkpoint(
     return ckpt
 
 
+def _append_jsonl(path: str | Path, payload: dict[str, Any]) -> None:
+    """Append a JSON record to a JSONL file."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
+def _train_cfg_to_dict(cfg: C.TrainConfig) -> dict[str, Any]:
+    return {
+        "batch_size": cfg.batch_size,
+        "lr": cfg.lr,
+        "weight_decay": cfg.weight_decay,
+        "warmup_steps": cfg.warmup_steps,
+        "max_epochs": cfg.max_epochs,
+        "grad_clip": cfg.grad_clip,
+        "label_smoothing": cfg.label_smoothing,
+        "val_fraction": cfg.val_fraction,
+        "test_fraction": cfg.test_fraction,
+        "seed": cfg.seed,
+        "tanimoto_interval": cfg.tanimoto_interval,
+        "tanimoto_rl_samples": cfg.tanimoto_rl_samples,
+        "rl_tanimoto_weight": cfg.rl_tanimoto_weight,
+        "rl_token_weight": cfg.rl_token_weight,
+        "rl_scale_boost": cfg.rl_scale_boost,
+        "best_ckpt_tanimoto_weight": cfg.best_ckpt_tanimoto_weight,
+        "best_ckpt_token_acc_weight": cfg.best_ckpt_token_acc_weight,
+        "best_ckpt_validity_weight": cfg.best_ckpt_validity_weight,
+        "best_ckpt_metric_tolerance": cfg.best_ckpt_metric_tolerance,
+        "beam_size": cfg.beam_size,
+        "top_k_output": cfg.top_k_output,
+        "ppm_noise_std": cfg.ppm_noise_std,
+        "mult_drop_prob": cfg.mult_drop_prob,
+        "j_noise_std": cfg.j_noise_std,
+        "peak_drop_prob": cfg.peak_drop_prob,
+    }
+
+
+def _model_cfg_to_dict(cfg: C.ModelConfig) -> dict[str, Any]:
+    return {
+        "enc_d_model": cfg.enc_d_model,
+        "enc_nhead": cfg.enc_nhead,
+        "enc_layers": cfg.enc_layers,
+        "enc_dim_ff": cfg.enc_dim_ff,
+        "enc_dropout": cfg.enc_dropout,
+        "enc_num_inds": cfg.enc_num_inds,
+        "enc_num_seeds": cfg.enc_num_seeds,
+        "dec_d_model": cfg.dec_d_model,
+        "dec_nhead": cfg.dec_nhead,
+        "dec_layers": cfg.dec_layers,
+        "dec_dim_ff": cfg.dec_dim_ff,
+        "dec_dropout": cfg.dec_dropout,
+        "num_global_features": cfg.num_global_features,
+        "num_formula_features": cfg.num_formula_features,
+        "retrieval_dim": cfg.retrieval_dim,
+        "retrieval_top_k": cfg.retrieval_top_k,
+    }
+
+
+def _make_execution_dir(mode: str, study_name: Optional[str]) -> Path:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    study_slug = (study_name or "study").replace(" ", "_")
+    execution_dir = Path(C.LOG_DIR) / f"{timestamp}_{mode}_{study_slug}"
+    execution_dir.mkdir(parents=True, exist_ok=True)
+    return execution_dir
+
+
+def _copy_if_exists(src: str | Path, dst: str | Path) -> None:
+    src_path = Path(src)
+    if not src_path.exists():
+        return
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, dst_path)
+
+
+def _copytree_if_exists(src: str | Path, dst: str | Path) -> None:
+    src_path = Path(src)
+    if not src_path.exists():
+        return
+    dst_path = Path(dst)
+    if dst_path.exists():
+        shutil.rmtree(dst_path)
+    shutil.copytree(src_path, dst_path)
+
+
 def inverse_quality_score(
     token_acc: float,
     tanimoto: float,
@@ -241,6 +328,7 @@ def train_inverse(
     mcfg: C.ModelConfig = C.ModelConfig(),
     resume_path: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
+    shared_log_path: Optional[str] = None,
     return_summary: bool = False,
 ):
     """Train the inverse model (spectrum → SELFIES)."""
@@ -269,6 +357,7 @@ def train_inverse(
     best_tanimoto = 0.0
     best_validity = 0.0
     best_inverse_score = float("-inf")
+    best_checkpoint_path: Optional[str] = None
 
     if resume_path and os.path.exists(resume_path):
         ckpt = load_checkpoint(model, optimizer, resume_path)
@@ -465,6 +554,8 @@ def train_inverse(
             tcfg,
         )
         record = {
+            "record_type": "epoch_metrics",
+            "model": "inverse",
             "epoch": epoch,
             "step": global_step,
             "train_ce_loss": round(avg_train_loss, 5),
@@ -486,6 +577,8 @@ def train_inverse(
         )
         log_file.write(json.dumps(record) + "\n")
         log_file.flush()
+        if shared_log_path:
+            _append_jsonl(shared_log_path, record)
 
         # ── Checkpoint ────────────────────────────────────────────────────
         save_best, candidate_score = should_save_best_inverse_checkpoint(
@@ -519,6 +612,7 @@ def train_inverse(
                     "best_inverse_score": best_inverse_score,
                 },
             )
+            best_checkpoint_path = os.path.join(ckpt_dir, "best.pt")
             print(
                 "  ✓ Saved best checkpoint "
                 f"(score={best_inverse_score:.4f}, token_acc={best_token_acc:.4f}, "
@@ -550,6 +644,7 @@ def train_inverse(
         "best_tanimoto": best_tanimoto,
         "best_validity": best_validity,
         "best_inverse_score": best_inverse_score,
+        "best_checkpoint_path": best_checkpoint_path,
         "checkpoint_dir": ckpt_dir,
     }
     print(
@@ -662,6 +757,7 @@ def train_forward(
     mcfg: C.ModelConfig = C.ModelConfig(),
     resume_path: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
+    shared_log_path: Optional[str] = None,
     return_summary: bool = False,
 ):
     """Train the forward model (SELFIES → spectrum)."""
@@ -680,6 +776,7 @@ def train_forward(
     start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
+    best_checkpoint_path: Optional[str] = None
 
     if resume_path and os.path.exists(resume_path):
         ckpt = load_checkpoint(model, optimizer, resume_path)
@@ -754,6 +851,8 @@ def train_forward(
         val_loss = evaluate_forward(model, val_dl, vocab)
 
         record = {
+            "record_type": "epoch_metrics",
+            "model": "forward",
             "epoch": epoch,
             "step": global_step,
             "train_loss": round(avg_train_loss, 5),
@@ -767,6 +866,8 @@ def train_forward(
         )
         log_file.write(json.dumps(record) + "\n")
         log_file.flush()
+        if shared_log_path:
+            _append_jsonl(shared_log_path, record)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -778,6 +879,7 @@ def train_forward(
                 val_loss,
                 os.path.join(ckpt_dir, "best.pt"),
             )
+            best_checkpoint_path = os.path.join(ckpt_dir, "best.pt")
             print("  ✓ Saved best checkpoint")
 
         if (epoch + 1) % 5 == 0:
@@ -793,6 +895,7 @@ def train_forward(
     log_file.close()
     summary = {
         "best_val_loss": best_val_loss,
+        "best_checkpoint_path": best_checkpoint_path,
         "checkpoint_dir": ckpt_dir,
     }
     print(f"\n[Done] Best validation loss: {best_val_loss:.4f}")
@@ -836,8 +939,28 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
     _ensure_optuna_available()
     base_tcfg, base_mcfg = _build_base_configs(args)
 
-    artifact_root = Path(args.optuna_artifact_dir or C.CHECKPOINT_DIR) / "optuna"
-    artifact_root.mkdir(parents=True, exist_ok=True)
+    execution_dir = _make_execution_dir(args.mode, args.optuna_study_name)
+    trials_root = execution_dir / "trials"
+    trials_root.mkdir(parents=True, exist_ok=True)
+    trial_summary_log = execution_dir / "trial_best_metrics.jsonl"
+    _append_jsonl(
+        execution_dir / "execution_metadata.jsonl",
+        {
+            "record_type": "execution_start",
+            "mode": args.mode,
+            "study_name": args.optuna_study_name,
+            "db": args.db,
+            "limit": args.limit,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "test_fraction": args.test_fraction,
+            "restrict_carbons_to_peaks": args.restrict_carbons_to_peaks,
+            "optuna_trials": args.optuna_trials,
+            "optuna_timeout": args.optuna_timeout,
+            "optuna_storage": args.optuna_storage,
+        },
+    )
 
     if args.mode == "forward":
         direction = "minimize"
@@ -855,8 +978,21 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
     def objective(trial: Any) -> float:
         tcfg = C.suggest_train_config(trial, base=base_tcfg)
         mcfg = C.suggest_model_config(trial, base=base_mcfg)
-        trial_dir = artifact_root / args.mode / f"trial_{trial.number:04d}"
+        trial_dir = trials_root / f"trial_{trial.number:04d}"
         trial_dir.mkdir(parents=True, exist_ok=True)
+        trial_log_path = trial_dir / "trial_log.jsonl"
+
+        _append_jsonl(
+            trial_log_path,
+            {
+                "record_type": "trial_start",
+                "trial_number": trial.number,
+                "mode": args.mode,
+                "optuna_params": dict(trial.params),
+                "train_config": _train_cfg_to_dict(tcfg),
+                "model_config": _model_cfg_to_dict(mcfg),
+            },
+        )
 
         vocab_path = str(trial_dir / "vocab.pkl")
         test_ids_path = str(trial_dir / "test_ids.json")
@@ -877,12 +1013,27 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
                 tcfg,
                 mcfg,
                 checkpoint_dir=str(trial_dir / "inverse"),
+                shared_log_path=str(trial_log_path),
                 return_summary=True,
             )
             trial.set_user_attr("best_token_acc", summary["best_token_acc"])
             trial.set_user_attr("best_tanimoto", summary["best_tanimoto"])
             trial.set_user_attr("best_validity", summary["best_validity"])
             trial.set_user_attr("best_val_loss", summary["best_val_loss"])
+            _append_jsonl(
+                trial_summary_log,
+                {
+                    "trial_number": trial.number,
+                    "mode": args.mode,
+                    "score": float(summary["best_inverse_score"]),
+                    "best_token_acc": summary["best_token_acc"],
+                    "best_tanimoto": summary["best_tanimoto"],
+                    "best_validity": summary["best_validity"],
+                    "best_val_loss": summary["best_val_loss"],
+                    "best_checkpoint_path": summary["best_checkpoint_path"],
+                    "test_ids_path": test_ids_path,
+                },
+            )
             return float(summary["best_inverse_score"])
 
         if args.mode == "forward":
@@ -893,9 +1044,21 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
                 tcfg,
                 mcfg,
                 checkpoint_dir=str(trial_dir / "forward"),
+                shared_log_path=str(trial_log_path),
                 return_summary=True,
             )
             trial.set_user_attr("best_val_loss", summary["best_val_loss"])
+            _append_jsonl(
+                trial_summary_log,
+                {
+                    "trial_number": trial.number,
+                    "mode": args.mode,
+                    "score": float(summary["best_val_loss"]),
+                    "best_val_loss": summary["best_val_loss"],
+                    "best_checkpoint_path": summary["best_checkpoint_path"],
+                    "test_ids_path": test_ids_path,
+                },
+            )
             return float(summary["best_val_loss"])
 
         inverse_summary = train_inverse(
@@ -905,6 +1068,7 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
             tcfg,
             mcfg,
             checkpoint_dir=str(trial_dir / "inverse"),
+            shared_log_path=str(trial_log_path),
             return_summary=True,
         )
         forward_summary = train_forward(
@@ -914,6 +1078,7 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
             tcfg,
             mcfg,
             checkpoint_dir=str(trial_dir / "forward"),
+            shared_log_path=str(trial_log_path),
             return_summary=True,
         )
         combined_score = float(inverse_summary["best_inverse_score"]) - float(
@@ -924,6 +1089,22 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
         trial.set_user_attr("best_validity", inverse_summary["best_validity"])
         trial.set_user_attr("inverse_score", inverse_summary["best_inverse_score"])
         trial.set_user_attr("forward_best_val_loss", forward_summary["best_val_loss"])
+        _append_jsonl(
+            trial_summary_log,
+            {
+                "trial_number": trial.number,
+                "mode": args.mode,
+                "score": combined_score,
+                "best_token_acc": inverse_summary["best_token_acc"],
+                "best_tanimoto": inverse_summary["best_tanimoto"],
+                "best_validity": inverse_summary["best_validity"],
+                "inverse_score": inverse_summary["best_inverse_score"],
+                "forward_best_val_loss": forward_summary["best_val_loss"],
+                "inverse_best_checkpoint_path": inverse_summary["best_checkpoint_path"],
+                "forward_best_checkpoint_path": forward_summary["best_checkpoint_path"],
+                "test_ids_path": test_ids_path,
+            },
+        )
         return combined_score
 
     study.optimize(objective, n_trials=args.optuna_trials, timeout=args.optuna_timeout)
@@ -937,6 +1118,43 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
         print("[Optuna] Best trial metrics:")
         for key, value in study.best_trial.user_attrs.items():
             print(f"  - {key}: {value}")
+
+    best_trial_dir = trials_root / f"trial_{study.best_trial.number:04d}"
+    best_artifacts_dir = execution_dir / "best_checkpoint"
+    best_artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.mode == "inverse":
+        _copy_if_exists(
+            best_trial_dir / "inverse" / "best.pt",
+            best_artifacts_dir / "best.pt",
+        )
+    elif args.mode == "forward":
+        _copy_if_exists(
+            best_trial_dir / "forward" / "best.pt",
+            best_artifacts_dir / "best.pt",
+        )
+    else:
+        _copy_if_exists(
+            best_trial_dir / "inverse" / "best.pt",
+            best_artifacts_dir / "inverse_best.pt",
+        )
+        _copy_if_exists(
+            best_trial_dir / "forward" / "best.pt",
+            best_artifacts_dir / "forward_best.pt",
+        )
+
+    _copy_if_exists(best_trial_dir / "vocab.pkl", execution_dir / "vocab.pkl")
+    _copy_if_exists(best_trial_dir / "test_ids.json", execution_dir / "test_ids.json")
+    _append_jsonl(
+        execution_dir / "execution_metadata.jsonl",
+        {
+            "record_type": "execution_complete",
+            "best_trial_number": study.best_trial.number,
+            "best_value": study.best_value,
+            "best_params": dict(study.best_trial.params),
+            "best_user_attrs": dict(study.best_trial.user_attrs),
+        },
+    )
 
 
 def _build_forward_targets(

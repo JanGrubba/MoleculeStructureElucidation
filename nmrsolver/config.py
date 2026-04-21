@@ -24,6 +24,7 @@ TABLE_NAME = "nmr_data"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 INDEX_DIR = os.path.join(PROJECT_ROOT, "indexes")
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SPECTRUM TOKENISATION
@@ -183,7 +184,7 @@ class TrainConfig:
     lr: float = 3e-4  # Learning rate. Min: 1e-6, Max: 1e-2.
     weight_decay: float = 1e-2  # L2 regularization strength. Min: 0.0, Max: 1.0.
     warmup_steps: int = 4000  # Steps to linearly increase LR. Min: 0, Max: 10,000+.
-    max_epochs: int = 60  # Maximum training epochs. Min: 1, Max: 1000+.
+    max_epochs: int = 2  # Maximum training epochs. Min: 1, Max: 1000+.
     grad_clip: float = 1.0  # Maximum gradient norm. Min: 0.0, Max: 10.0+.
     label_smoothing: float = 0.1  # Smoothing for target labels. Min: 0.0, Max: 0.2.
     val_fraction: float = 0.05  # Fraction of data for validation. Min: 0.0, Max: 0.5.
@@ -250,7 +251,8 @@ def suggest_model_config(trial: Any, base: ModelConfig | None = None) -> ModelCo
     enc_d_model = int(
         trial.suggest_categorical(
             "enc_d_model",
-            [128, 192, 256, 320, 384, 512],
+            # [128, 192, 256, 320, 384, 512],
+            [128, 192, 256],
         )
     )
 
@@ -259,7 +261,7 @@ def suggest_model_config(trial: Any, base: ModelConfig | None = None) -> ModelCo
     if not head_choices:
         head_choices = [1]
     enc_nhead = int(trial.suggest_categorical("enc_nhead", head_choices))
-    enc_layers = trial.suggest_int("enc_layers", 2, 12)
+    enc_layers = trial.suggest_int("enc_layers", 2, 8)
     enc_dim_ff = int(
         trial.suggest_categorical(
             "enc_dim_ff", [enc_d_model, 2 * enc_d_model, 4 * enc_d_model]

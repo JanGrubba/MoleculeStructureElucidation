@@ -238,7 +238,7 @@ class SelfiesVocab:
     def build_from_data(
         cls,
         selfies_list: List[str],
-        min_freq: int = 2,
+        min_freq: int = 2,  # TODO przeanalizować wpływ na dane i model
     ) -> "SelfiesVocab":
         """Build vocabulary from a list of SELFIES strings."""
         counter: Counter = Counter()
