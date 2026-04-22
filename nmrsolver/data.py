@@ -26,10 +26,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import selfies as sf
 import torch
+import torch.distributed as dist
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import (
+    DataLoader,
+    Dataset,
+    DistributedSampler,
+    Subset,
+    random_split,
+)
 
 from . import config as C
 
@@ -488,6 +495,9 @@ def make_dataloaders(
     train_cfg: Optional[C.TrainConfig] = None,
     test_ids_path: Optional[str] = None,
     restrict_carbons_to_peaks: bool = False,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, SelfiesVocab]:
     """
     Build train + val + test dataloaders from the database.
@@ -520,17 +530,38 @@ def make_dataloaders(
             f"({len(rows)} rows)"
         )
 
+    def _distributed_barrier() -> None:
+        if distributed and dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
     # Build or load vocab
-    if vocab_path and os.path.exists(vocab_path):
-        vocab = SelfiesVocab.load(vocab_path)
-        print(f"[Data] Vocab loaded from {vocab_path} ({len(vocab)} tokens)")
+    vocab: Optional[SelfiesVocab] = None
+    if distributed and vocab_path:
+        if rank == 0:
+            if os.path.exists(vocab_path):
+                vocab = SelfiesVocab.load(vocab_path)
+                print(f"[Data] Vocab loaded from {vocab_path} ({len(vocab)} tokens)")
+            else:
+                selfies_strs = [r["selfies"] for r in rows if r.get("selfies")]
+                vocab = SelfiesVocab.build_from_data(selfies_strs, min_freq=2)
+                os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
+                vocab.save(vocab_path)
+                print(f"[Data] Vocab saved to {vocab_path}")
+        _distributed_barrier()
+        if rank != 0:
+            vocab = SelfiesVocab.load(vocab_path)
     else:
-        selfies_strs = [r["selfies"] for r in rows if r.get("selfies")]
-        vocab = SelfiesVocab.build_from_data(selfies_strs, min_freq=2)
-        if vocab_path:
-            os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
-            vocab.save(vocab_path)
-            print(f"[Data] Vocab saved to {vocab_path}")
+        if vocab_path and os.path.exists(vocab_path):
+            vocab = SelfiesVocab.load(vocab_path)
+            print(f"[Data] Vocab loaded from {vocab_path} ({len(vocab)} tokens)")
+        else:
+            selfies_strs = [r["selfies"] for r in rows if r.get("selfies")]
+            vocab = SelfiesVocab.build_from_data(selfies_strs, min_freq=2)
+            if vocab_path:
+                os.makedirs(os.path.dirname(vocab_path), exist_ok=True)
+                vocab.save(vocab_path)
+                print(f"[Data] Vocab saved to {vocab_path}")
+    assert vocab is not None
 
     # Split
     n_train, n_val, n_test = _compute_split_sizes(
@@ -545,7 +576,7 @@ def make_dataloaders(
     val_rows = [rows[i] for i in indices[n_train : n_train + n_val]]
     test_rows = [rows[i] for i in indices[n_train + n_val : n_train + n_val + n_test]]
 
-    if test_ids_path:
+    if test_ids_path and (not distributed or rank == 0):
         _save_split_ids(test_rows, test_ids_path)
         print(f"[Data] Test IDs saved to {test_ids_path}")
 
@@ -553,10 +584,38 @@ def make_dataloaders(
     val_ds = NMRDataset(val_rows, vocab, augment=False)
     test_ds = NMRDataset(test_rows, vocab, augment=False)
 
+    train_sampler = None
+    val_sampler = None
+    test_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=tcfg.seed,
+            drop_last=True,
+        )
+        val_sampler = DistributedSampler(
+            val_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        test_sampler = DistributedSampler(
+            test_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            drop_last=False,
+        )
+
     train_dl = DataLoader(
         train_ds,
         batch_size=tcfg.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
@@ -566,6 +625,7 @@ def make_dataloaders(
         val_ds,
         batch_size=tcfg.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
@@ -574,6 +634,7 @@ def make_dataloaders(
         test_ds,
         batch_size=tcfg.batch_size,
         shuffle=False,
+        sampler=test_sampler,
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,

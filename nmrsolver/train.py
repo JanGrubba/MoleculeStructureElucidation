@@ -25,13 +25,16 @@ from typing import Any, Optional
 import numpy as np
 import selfies as sf
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from rdkit import Chem
 from rdkit.Chem import DataStructs, RDKFingerprint
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DistributedSampler
 from torch.utils.data import DataLoader
 
 from . import config as C
@@ -53,22 +56,66 @@ from .models import ForwardModel, InverseModel
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 GPU_IDS: list[int] = []
 USE_MULTI_GPU = False
+USE_DDP = False
+WORLD_SIZE = 1
+RANK = 0
+LOCAL_RANK = 0
 optuna: Any | None = None
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
     """Return the underlying model when wrapped for multi-GPU training."""
-    return model.module if isinstance(model, nn.DataParallel) else model
+    return model.module if isinstance(model, (nn.DataParallel, DDP)) else model
+
+
+def _is_distributed() -> bool:
+    return USE_DDP and dist.is_available() and dist.is_initialized()
+
+
+def _is_main_process() -> bool:
+    return RANK == 0
+
+
+def _distributed_barrier() -> None:
+    if _is_distributed():
+        dist.barrier()
+
+
+def _set_dataloader_epoch(dataloader: DataLoader, epoch: int) -> None:
+    sampler = getattr(dataloader, "sampler", None)
+    if isinstance(sampler, DistributedSampler):
+        sampler.set_epoch(epoch)
+
+
+def _reduce_sum(values: list[float]) -> list[float]:
+    if not _is_distributed():
+        return values
+    tensor = torch.tensor(values, device=DEVICE, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.tolist()
+
+
+def _cleanup_distributed() -> None:
+    if _is_distributed():
+        dist.destroy_process_group()
 
 
 def _configure_runtime(args: argparse.Namespace) -> None:
     """Configure the runtime device and optional multi-GPU execution."""
-    global DEVICE, GPU_IDS, USE_MULTI_GPU
+    global DEVICE, GPU_IDS, USE_MULTI_GPU, USE_DDP, WORLD_SIZE, RANK, LOCAL_RANK
+
+    WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+    RANK = int(os.environ.get("RANK", "0"))
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 
     if not torch.cuda.is_available():
         DEVICE = torch.device("cpu")
         GPU_IDS = []
         USE_MULTI_GPU = False
+        USE_DDP = False
+        WORLD_SIZE = 1
+        RANK = 0
+        LOCAL_RANK = 0
         return
 
     available_gpu_count = torch.cuda.device_count()
@@ -87,16 +134,42 @@ def _configure_runtime(args: argparse.Namespace) -> None:
         )
 
     GPU_IDS = gpu_ids or [0]
+    USE_DDP = WORLD_SIZE > 1
+    USE_MULTI_GPU = USE_DDP
+
+    if USE_DDP:
+        if LOCAL_RANK >= len(GPU_IDS):
+            raise ValueError(
+                f"LOCAL_RANK={LOCAL_RANK} exceeds selected GPU count {len(GPU_IDS)}. "
+                "Use matching `torchrun --nproc_per_node` and `--gpu-ids`, or omit `--gpu-ids`."
+            )
+        selected_gpu = GPU_IDS[LOCAL_RANK]
+        DEVICE = torch.device(f"cuda:{selected_gpu}")
+        torch.cuda.set_device(selected_gpu)
+        dist.init_process_group(backend="nccl")
+        WORLD_SIZE = dist.get_world_size()
+        RANK = dist.get_rank()
+        USE_MULTI_GPU = WORLD_SIZE > 1
+        return
+
+    if args.multi_gpu and len(GPU_IDS) > 1:
+        raise ValueError(
+            "Distributed multi-GPU training now uses torchrun. Launch with `torchrun --nproc_per_node=<num_gpus> -m nmrsolver.train ...`"
+        )
+
     DEVICE = torch.device(f"cuda:{GPU_IDS[0]}")
     torch.cuda.set_device(GPU_IDS[0])
-    USE_MULTI_GPU = bool(args.multi_gpu and len(GPU_IDS) > 1)
 
 
 def _prepare_model_for_training(model: nn.Module) -> nn.Module:
     """Move a model to the active device and wrap it for multi-GPU if requested."""
     model = model.to(DEVICE)
-    if USE_MULTI_GPU:
-        model = nn.DataParallel(model, device_ids=GPU_IDS, output_device=GPU_IDS[0])
+    if USE_DDP:
+        model = DDP(
+            model,
+            device_ids=[DEVICE.index],
+            output_device=DEVICE.index,
+        )
     return model
 
 
@@ -378,20 +451,22 @@ def train_inverse(
     return_summary: bool = False,
 ):
     """Train the inverse model (spectrum → SELFIES)."""
-    print(f"\n{'='*72}")
-    print("  INVERSE MODEL TRAINING  (Spectrum → SELFIES)")
-    print(f"{'='*72}")
+    if _is_main_process():
+        print(f"\n{'='*72}")
+        print("  INVERSE MODEL TRAINING  (Spectrum → SELFIES)")
+        print(f"{'='*72}")
 
     model = _prepare_model_for_training(InverseModel(vocab_size=len(vocab), cfg=mcfg))
-    print(f"[Model] Parameters: {count_params(_unwrap_model(model)):,}")
-    print(
-        f"[Model] Device: {DEVICE}"
-        + (
-            f" | DataParallel GPUs={GPU_IDS}"
-            if USE_MULTI_GPU
-            else f" | GPUs={[GPU_IDS[0]]}" if GPU_IDS else ""
+    if _is_main_process():
+        print(f"[Model] Parameters: {count_params(_unwrap_model(model)):,}")
+        print(
+            f"[Model] Device: {DEVICE}"
+            + (
+                f" | DDP world_size={WORLD_SIZE} GPUs={GPU_IDS[:WORLD_SIZE]}"
+                if USE_DDP
+                else f" | GPU={GPU_IDS[0]}" if GPU_IDS else ""
+            )
         )
-    )
 
     optimizer = AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
     scheduler = LambdaLR(optimizer, get_lr_lambda(tcfg.warmup_steps))
@@ -431,13 +506,14 @@ def train_inverse(
                 ),
             )
         )
-        print(f"[Resume] epoch={start_epoch}, step={global_step}")
+        if _is_main_process():
+            print(f"[Resume] epoch={start_epoch}, step={global_step}")
 
     ckpt_dir = checkpoint_dir or os.path.join(C.CHECKPOINT_DIR, "inverse")
     os.makedirs(ckpt_dir, exist_ok=True)
 
     log_path = os.path.join(ckpt_dir, "training_log.jsonl")
-    log_file = open(log_path, "a")
+    log_file = open(log_path, "a") if _is_main_process() else None
 
     # Exponential moving averages for auto-scaling CE and RL losses
     ema_ce = 1.0
@@ -448,6 +524,7 @@ def train_inverse(
 
     for epoch in range(start_epoch, tcfg.max_epochs):
         model.train()
+        _set_dataloader_epoch(train_dl, epoch)
         epoch_loss = 0.0
         epoch_rl_loss = 0.0
         n_batches = 0
@@ -484,9 +561,10 @@ def train_inverse(
                 )
 
             if not torch.isfinite(ce_loss):
-                print(
-                    f"  [Warn] Non-finite CE loss at step {global_step}; skipping batch"
-                )
+                if _is_main_process():
+                    print(
+                        f"  [Warn] Non-finite CE loss at step {global_step}; skipping batch"
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
@@ -510,9 +588,10 @@ def train_inverse(
                             eos_idx=vocab.eos_idx,
                         )
                 except Exception as exc:
-                    print(
-                        f"  [Warn] RL generation skipped at step {global_step}: {exc}"
-                    )
+                    if _is_main_process():
+                        print(
+                            f"  [Warn] RL generation skipped at step {global_step}: {exc}"
+                        )
                     loss = ce_loss
                     use_rl = False
 
@@ -607,13 +686,19 @@ def train_inverse(
                 lr = scheduler.get_last_lr()[0]
                 avg_ce = epoch_loss / n_batches
                 avg_rl = epoch_rl_loss / max(n_rl_batches, 1)
-                print(
-                    f"  [E{epoch:02d} | step {global_step:6d}] "
-                    f"ce={avg_ce:.4f}  rl={avg_rl:.4f}  lr={lr:.2e}"
-                )
+                if _is_main_process():
+                    print(
+                        f"  [E{epoch:02d} | step {global_step:6d}] "
+                        f"ce={avg_ce:.4f}  rl={avg_rl:.4f}  lr={lr:.2e}"
+                    )
 
         # ── Epoch summary ─────────────────────────────────────────────────
         epoch_time = time.time() - t0
+        epoch_loss, epoch_rl_loss, n_batches, n_rl_batches = _reduce_sum(
+            [epoch_loss, epoch_rl_loss, float(n_batches), float(n_rl_batches)]
+        )
+        n_batches = int(n_batches)
+        n_rl_batches = int(n_rl_batches)
         avg_train_loss = epoch_loss / max(n_batches, 1)
 
         # ── Validation ────────────────────────────────────────────────────
@@ -643,16 +728,18 @@ def train_inverse(
             "lr": scheduler.get_last_lr()[0],
             "time_s": round(epoch_time, 1),
         }
-        print(
-            f"\n  Epoch {epoch:02d} done in {epoch_time:.0f}s  │ "
-            f"ce_loss={avg_train_loss:.4f}  rl_loss={avg_rl_epoch:.4f}  "
-            f"val_loss={val_loss:.4f}  "
-            f"token_acc={val_acc:.3f}  tanimoto={val_tani:.3f}  validity={val_validity:.3f}  "
-            f"score={current_inverse_score:.3f}"
-        )
-        log_file.write(json.dumps(record) + "\n")
-        log_file.flush()
-        if shared_log_path:
+        if _is_main_process():
+            print(
+                f"\n  Epoch {epoch:02d} done in {epoch_time:.0f}s  │ "
+                f"ce_loss={avg_train_loss:.4f}  rl_loss={avg_rl_epoch:.4f}  "
+                f"val_loss={val_loss:.4f}  "
+                f"token_acc={val_acc:.3f}  tanimoto={val_tani:.3f}  validity={val_validity:.3f}  "
+                f"score={current_inverse_score:.3f}"
+            )
+            assert log_file is not None
+            log_file.write(json.dumps(record) + "\n")
+            log_file.flush()
+        if shared_log_path and _is_main_process():
             _append_jsonl(shared_log_path, record)
 
         # ── Checkpoint ────────────────────────────────────────────────────
@@ -672,30 +759,31 @@ def train_inverse(
             best_tanimoto = val_tani
             best_validity = val_validity
             best_inverse_score = candidate_score
-            save_checkpoint(
-                model,
-                optimizer,
-                epoch,
-                global_step,
-                candidate_score,
-                os.path.join(ckpt_dir, "best.pt"),
-                extra_state={
-                    "best_val_loss": val_loss,
-                    "best_token_acc": best_token_acc,
-                    "best_tanimoto": best_tanimoto,
-                    "best_validity": best_validity,
-                    "best_inverse_score": best_inverse_score,
-                },
-            )
             best_checkpoint_path = os.path.join(ckpt_dir, "best.pt")
-            print(
-                "  ✓ Saved best checkpoint "
-                f"(score={best_inverse_score:.4f}, token_acc={best_token_acc:.4f}, "
-                f"tanimoto={best_tanimoto:.4f}, validity={best_validity:.4f})"
-            )
+            if _is_main_process():
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    global_step,
+                    candidate_score,
+                    os.path.join(ckpt_dir, "best.pt"),
+                    extra_state={
+                        "best_val_loss": val_loss,
+                        "best_token_acc": best_token_acc,
+                        "best_tanimoto": best_tanimoto,
+                        "best_validity": best_validity,
+                        "best_inverse_score": best_inverse_score,
+                    },
+                )
+                print(
+                    "  ✓ Saved best checkpoint "
+                    f"(score={best_inverse_score:.4f}, token_acc={best_token_acc:.4f}, "
+                    f"tanimoto={best_tanimoto:.4f}, validity={best_validity:.4f})"
+                )
 
         # Save periodic checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 5 == 0 and _is_main_process():
             save_checkpoint(
                 model,
                 optimizer,
@@ -712,7 +800,8 @@ def train_inverse(
                 },
             )
 
-    log_file.close()
+    if log_file is not None:
+        log_file.close()
     summary = {
         "best_val_loss": best_val_loss,
         "best_token_acc": best_token_acc,
@@ -722,10 +811,11 @@ def train_inverse(
         "best_checkpoint_path": best_checkpoint_path,
         "checkpoint_dir": ckpt_dir,
     }
-    print(
-        f"\n[Done] Best inverse score: {best_inverse_score:.4f} "
-        f"(token_acc={best_token_acc:.4f}, tanimoto={best_tanimoto:.4f}, validity={best_validity:.4f})"
-    )
+    if _is_main_process():
+        print(
+            f"\n[Done] Best inverse score: {best_inverse_score:.4f} "
+            f"(token_acc={best_token_acc:.4f}, tanimoto={best_tanimoto:.4f}, validity={best_validity:.4f})"
+        )
     if return_summary:
         return summary
     return model
@@ -810,10 +900,32 @@ def evaluate_inverse(
 
         n_batches += 1
 
+    (
+        total_loss,
+        total_correct,
+        total_tokens,
+        tani_sum,
+        tani_count,
+        validity_sum,
+        validity_count,
+        n_batches,
+    ) = _reduce_sum(
+        [
+            total_loss,
+            float(total_correct),
+            float(total_tokens),
+            float(sum(tanimoto_scores)),
+            float(len(tanimoto_scores)),
+            float(sum(validity_scores)),
+            float(len(validity_scores)),
+            float(n_batches),
+        ]
+    )
+
     avg_loss = total_loss / max(n_batches, 1)
     token_acc = total_correct / max(total_tokens, 1)
-    avg_tani = float(np.mean(tanimoto_scores)) if tanimoto_scores else 0.0
-    avg_validity = float(np.mean(validity_scores)) if validity_scores else 0.0
+    avg_tani = tani_sum / max(tani_count, 1)
+    avg_validity = validity_sum / max(validity_count, 1)
 
     model.train()
     return avg_loss, token_acc, avg_tani, avg_validity
@@ -836,20 +948,22 @@ def train_forward(
     return_summary: bool = False,
 ):
     """Train the forward model (SELFIES → spectrum)."""
-    print(f"\n{'='*72}")
-    print("  FORWARD MODEL TRAINING  (SELFIES → Spectrum)")
-    print(f"{'='*72}")
+    if _is_main_process():
+        print(f"\n{'='*72}")
+        print("  FORWARD MODEL TRAINING  (SELFIES → Spectrum)")
+        print(f"{'='*72}")
 
     model = _prepare_model_for_training(ForwardModel(vocab_size=len(vocab), cfg=mcfg))
-    print(f"[Model] Parameters: {count_params(_unwrap_model(model)):,}")
-    print(
-        f"[Model] Device: {DEVICE}"
-        + (
-            f" | DataParallel GPUs={GPU_IDS}"
-            if USE_MULTI_GPU
-            else f" | GPUs={[GPU_IDS[0]]}" if GPU_IDS else ""
+    if _is_main_process():
+        print(f"[Model] Parameters: {count_params(_unwrap_model(model)):,}")
+        print(
+            f"[Model] Device: {DEVICE}"
+            + (
+                f" | DDP world_size={WORLD_SIZE} GPUs={GPU_IDS[:WORLD_SIZE]}"
+                if USE_DDP
+                else f" | GPU={GPU_IDS[0]}" if GPU_IDS else ""
+            )
         )
-    )
 
     optimizer = AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
     scheduler = LambdaLR(optimizer, get_lr_lambda(tcfg.warmup_steps))
@@ -865,16 +979,18 @@ def train_forward(
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["step"]
         best_val_loss = ckpt.get("loss", float("inf"))
-        print(f"[Resume] epoch={start_epoch}, step={global_step}")
+        if _is_main_process():
+            print(f"[Resume] epoch={start_epoch}, step={global_step}")
 
     ckpt_dir = checkpoint_dir or os.path.join(C.CHECKPOINT_DIR, "forward")
     os.makedirs(ckpt_dir, exist_ok=True)
 
     log_path = os.path.join(ckpt_dir, "training_log.jsonl")
-    log_file = open(log_path, "a")
+    log_file = open(log_path, "a") if _is_main_process() else None
 
     for epoch in range(start_epoch, tcfg.max_epochs):
         model.train()
+        _set_dataloader_epoch(train_dl, epoch)
         epoch_loss = 0.0
         n_batches = 0
         t0 = time.time()
@@ -921,12 +1037,15 @@ def train_forward(
             if global_step % 200 == 0:
                 lr = scheduler.get_last_lr()[0]
                 avg = epoch_loss / n_batches
-                print(
-                    f"  [E{epoch:02d} | step {global_step:6d}] "
-                    f"loss={avg:.4f}  lr={lr:.2e}"
-                )
+                if _is_main_process():
+                    print(
+                        f"  [E{epoch:02d} | step {global_step:6d}] "
+                        f"loss={avg:.4f}  lr={lr:.2e}"
+                    )
 
         epoch_time = time.time() - t0
+        epoch_loss, n_batches = _reduce_sum([epoch_loss, float(n_batches)])
+        n_batches = int(n_batches)
         avg_train_loss = epoch_loss / max(n_batches, 1)
 
         # Validation
@@ -942,29 +1061,32 @@ def train_forward(
             "lr": scheduler.get_last_lr()[0],
             "time_s": round(epoch_time, 1),
         }
-        print(
-            f"\n  Epoch {epoch:02d} done in {epoch_time:.0f}s  │ "
-            f"train_loss={avg_train_loss:.4f}  val_loss={val_loss:.4f}"
-        )
-        log_file.write(json.dumps(record) + "\n")
-        log_file.flush()
-        if shared_log_path:
+        if _is_main_process():
+            print(
+                f"\n  Epoch {epoch:02d} done in {epoch_time:.0f}s  │ "
+                f"train_loss={avg_train_loss:.4f}  val_loss={val_loss:.4f}"
+            )
+            assert log_file is not None
+            log_file.write(json.dumps(record) + "\n")
+            log_file.flush()
+        if shared_log_path and _is_main_process():
             _append_jsonl(shared_log_path, record)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(
-                model,
-                optimizer,
-                epoch,
-                global_step,
-                val_loss,
-                os.path.join(ckpt_dir, "best.pt"),
-            )
             best_checkpoint_path = os.path.join(ckpt_dir, "best.pt")
-            print("  ✓ Saved best checkpoint")
+            if _is_main_process():
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    global_step,
+                    val_loss,
+                    os.path.join(ckpt_dir, "best.pt"),
+                )
+                print("  ✓ Saved best checkpoint")
 
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 5 == 0 and _is_main_process():
             save_checkpoint(
                 model,
                 optimizer,
@@ -974,13 +1096,15 @@ def train_forward(
                 os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pt"),
             )
 
-    log_file.close()
+    if log_file is not None:
+        log_file.close()
     summary = {
         "best_val_loss": best_val_loss,
         "best_checkpoint_path": best_checkpoint_path,
         "checkpoint_dir": ckpt_dir,
     }
-    print(f"\n[Done] Best validation loss: {best_val_loss:.4f}")
+    if _is_main_process():
+        print(f"\n[Done] Best validation loss: {best_val_loss:.4f}")
     if return_summary:
         return summary
     return model
@@ -1018,6 +1142,11 @@ def _build_base_configs(
 
 def run_optuna_finetuning(args: argparse.Namespace) -> None:
     """Run Optuna hyper-parameter tuning for the selected training mode."""
+    if _is_distributed():
+        raise ValueError(
+            "Optuna study execution is not supported inside a DDP torchrun launch. "
+            "Run Optuna in a single process, or launch one study worker per GPU separately."
+        )
     _ensure_optuna_available()
     base_tcfg, base_mcfg = _build_base_configs(args)
 
@@ -1085,6 +1214,9 @@ def run_optuna_finetuning(args: argparse.Namespace) -> None:
             train_cfg=tcfg,
             test_ids_path=test_ids_path,
             restrict_carbons_to_peaks=args.restrict_carbons_to_peaks,
+            distributed=False,
+            rank=0,
+            world_size=1,
         )
 
         if args.mode == "inverse":
@@ -1354,6 +1486,7 @@ def evaluate_forward(
         total_loss += loss.item()
         n += 1
 
+    total_loss, n = _reduce_sum([total_loss, float(n)])
     model.train()
     return total_loss / max(n, 1)
 
@@ -1459,7 +1592,7 @@ def main():
     parser.add_argument(
         "--multi-gpu",
         action="store_true",
-        help="Use all selected CUDA devices with DataParallel when more than one GPU is available",
+        help="Enable multi-GPU training via DistributedDataParallel when launched with torchrun",
     )
     parser.add_argument(
         "--gpu-ids",
@@ -1471,43 +1604,54 @@ def main():
 
     _configure_runtime(args)
 
-    if DEVICE.type == "cuda":
-        print(
-            f"[Runtime] CUDA available: {torch.cuda.device_count()} GPU(s) | selected={GPU_IDS}"
-            + (" | multi_gpu=enabled" if USE_MULTI_GPU else " | multi_gpu=disabled")
+    try:
+        if _is_main_process():
+            if DEVICE.type == "cuda":
+                print(
+                    f"[Runtime] CUDA available: {torch.cuda.device_count()} GPU(s) | selected={GPU_IDS}"
+                    + (
+                        f" | ddp=enabled rank={RANK}/{WORLD_SIZE} local_rank={LOCAL_RANK}"
+                        if USE_DDP
+                        else " | ddp=disabled"
+                    )
+                )
+            else:
+                print("[Runtime] CUDA not available; training on CPU")
+
+        if args.optuna_trials is not None:
+            run_optuna_finetuning(args)
+            return
+
+        # Build configs
+        tcfg, mcfg = _build_base_configs(args)
+
+        vocab_path = os.path.join(C.CHECKPOINT_DIR, "vocab.pkl")
+        test_ids_path = args.test_ids_out or os.path.join(
+            C.CHECKPOINT_DIR,
+            "test_ids.json",
         )
-    else:
-        print("[Runtime] CUDA not available; training on CPU")
+        train_dl, val_dl, test_dl, vocab = make_dataloaders(
+            db_path=args.db,
+            limit=args.limit,
+            vocab_path=vocab_path,
+            train_cfg=tcfg,
+            test_ids_path=test_ids_path,
+            restrict_carbons_to_peaks=args.restrict_carbons_to_peaks,
+            distributed=_is_distributed(),
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
 
-    if args.optuna_trials is not None:
-        run_optuna_finetuning(args)
-        return
+        if len(test_dl.dataset) > 0 and _is_main_process():
+            print(f"[Data] Held out {len(test_dl.dataset)} rows for final testing")
 
-    # Build configs
-    tcfg, mcfg = _build_base_configs(args)
+        if args.mode in ("inverse", "both"):
+            train_inverse(train_dl, val_dl, vocab, tcfg, mcfg, resume_path=args.resume)
 
-    vocab_path = os.path.join(C.CHECKPOINT_DIR, "vocab.pkl")
-    test_ids_path = args.test_ids_out or os.path.join(
-        C.CHECKPOINT_DIR,
-        "test_ids.json",
-    )
-    train_dl, val_dl, test_dl, vocab = make_dataloaders(
-        db_path=args.db,
-        limit=args.limit,
-        vocab_path=vocab_path,
-        train_cfg=tcfg,
-        test_ids_path=test_ids_path,
-        restrict_carbons_to_peaks=args.restrict_carbons_to_peaks,
-    )
-
-    if len(test_dl.dataset) > 0:
-        print(f"[Data] Held out {len(test_dl.dataset)} rows for final testing")
-
-    if args.mode in ("inverse", "both"):
-        train_inverse(train_dl, val_dl, vocab, tcfg, mcfg, resume_path=args.resume)
-
-    if args.mode in ("forward", "both"):
-        train_forward(train_dl, val_dl, vocab, tcfg, mcfg, resume_path=args.resume)
+        if args.mode in ("forward", "both"):
+            train_forward(train_dl, val_dl, vocab, tcfg, mcfg, resume_path=args.resume)
+    finally:
+        _cleanup_distributed()
 
 
 if __name__ == "__main__":
