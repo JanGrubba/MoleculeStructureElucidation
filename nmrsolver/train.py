@@ -51,7 +51,53 @@ from .models import ForwardModel, InverseModel
 # ──────────────────────────────────────────────────────────────────────────────
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+GPU_IDS: list[int] = []
+USE_MULTI_GPU = False
 optuna: Any | None = None
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying model when wrapped for multi-GPU training."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def _configure_runtime(args: argparse.Namespace) -> None:
+    """Configure the runtime device and optional multi-GPU execution."""
+    global DEVICE, GPU_IDS, USE_MULTI_GPU
+
+    if not torch.cuda.is_available():
+        DEVICE = torch.device("cpu")
+        GPU_IDS = []
+        USE_MULTI_GPU = False
+        return
+
+    available_gpu_count = torch.cuda.device_count()
+    requested_gpu_ids = args.gpu_ids
+    if requested_gpu_ids:
+        gpu_ids = [int(x.strip()) for x in requested_gpu_ids.split(",") if x.strip()]
+    else:
+        gpu_ids = list(range(available_gpu_count))
+
+    invalid_gpu_ids = [
+        gpu_id for gpu_id in gpu_ids if gpu_id >= available_gpu_count or gpu_id < 0
+    ]
+    if invalid_gpu_ids:
+        raise ValueError(
+            f"Invalid GPU ids {invalid_gpu_ids}; available GPU ids are 0..{available_gpu_count - 1}"
+        )
+
+    GPU_IDS = gpu_ids or [0]
+    DEVICE = torch.device(f"cuda:{GPU_IDS[0]}")
+    torch.cuda.set_device(GPU_IDS[0])
+    USE_MULTI_GPU = bool(args.multi_gpu and len(GPU_IDS) > 1)
+
+
+def _prepare_model_for_training(model: nn.Module) -> nn.Module:
+    """Move a model to the active device and wrap it for multi-GPU if requested."""
+    model = model.to(DEVICE)
+    if USE_MULTI_GPU:
+        model = nn.DataParallel(model, device_ids=GPU_IDS, output_device=GPU_IDS[0])
+    return model
 
 
 def get_lr_lambda(warmup: int):
@@ -125,7 +171,7 @@ def save_checkpoint(
         "epoch": epoch,
         "step": step,
         "loss": loss,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _unwrap_model(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
     if extra_state:
@@ -139,7 +185,7 @@ def load_checkpoint(
     path: str,
 ) -> dict:
     ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    _unwrap_model(model).load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     return ckpt
@@ -336,9 +382,16 @@ def train_inverse(
     print("  INVERSE MODEL TRAINING  (Spectrum → SELFIES)")
     print(f"{'='*72}")
 
-    model = InverseModel(vocab_size=len(vocab), cfg=mcfg).to(DEVICE)
-    print(f"[Model] Parameters: {count_params(model):,}")
-    print(f"[Model] Device: {DEVICE}")
+    model = _prepare_model_for_training(InverseModel(vocab_size=len(vocab), cfg=mcfg))
+    print(f"[Model] Parameters: {count_params(_unwrap_model(model)):,}")
+    print(
+        f"[Model] Device: {DEVICE}"
+        + (
+            f" | DataParallel GPUs={GPU_IDS}"
+            if USE_MULTI_GPU
+            else f" | GPUs={[GPU_IDS[0]]}" if GPU_IDS else ""
+        )
+    )
 
     optimizer = AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
     scheduler = LambdaLR(optimizer, get_lr_lambda(tcfg.warmup_steps))
@@ -448,7 +501,7 @@ def train_inverse(
                 n_rl = min(tcfg.tanimoto_rl_samples, spec.size(0))
                 try:
                     with torch.no_grad():
-                        generated = model.generate_greedy(
+                        generated = _unwrap_model(model).generate_greedy(
                             spec[:n_rl],
                             spec_mask[:n_rl],
                             gf[:n_rl],
@@ -680,7 +733,7 @@ def train_inverse(
 
 @torch.no_grad()
 def evaluate_inverse(
-    model: InverseModel,
+    model: nn.Module,
     val_dl: DataLoader,
     vocab: SelfiesVocab,
     criterion: nn.Module,
@@ -737,7 +790,7 @@ def evaluate_inverse(
 
         # Tanimoto on a few samples per batch (greedy decode is slow)
         if batch_idx < 5:
-            generated = model.generate_greedy(
+            generated = _unwrap_model(model).generate_greedy(
                 spec[:4],
                 spec_mask[:4],
                 gf[:4],
@@ -787,9 +840,16 @@ def train_forward(
     print("  FORWARD MODEL TRAINING  (SELFIES → Spectrum)")
     print(f"{'='*72}")
 
-    model = ForwardModel(vocab_size=len(vocab), cfg=mcfg).to(DEVICE)
-    print(f"[Model] Parameters: {count_params(model):,}")
-    print(f"[Model] Device: {DEVICE}")
+    model = _prepare_model_for_training(ForwardModel(vocab_size=len(vocab), cfg=mcfg))
+    print(f"[Model] Parameters: {count_params(_unwrap_model(model)):,}")
+    print(
+        f"[Model] Device: {DEVICE}"
+        + (
+            f" | DataParallel GPUs={GPU_IDS}"
+            if USE_MULTI_GPU
+            else f" | GPUs={[GPU_IDS[0]]}" if GPU_IDS else ""
+        )
+    )
 
     optimizer = AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
     scheduler = LambdaLR(optimizer, get_lr_lambda(tcfg.warmup_steps))
@@ -1260,7 +1320,7 @@ def _forward_loss(
 
 @torch.no_grad()
 def evaluate_forward(
-    model: ForwardModel,
+    model: nn.Module,
     val_dl: DataLoader,
     vocab: SelfiesVocab,
     max_eval_batches: int = 100,
@@ -1396,7 +1456,28 @@ def main():
         default=None,
         help="Directory where Optuna trial checkpoints/logs should be stored",
     )
+    parser.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        help="Use all selected CUDA devices with DataParallel when more than one GPU is available",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        type=str,
+        default=None,
+        help="Comma-separated CUDA device ids to use, e.g. '0,1,2,3'",
+    )
     args = parser.parse_args()
+
+    _configure_runtime(args)
+
+    if DEVICE.type == "cuda":
+        print(
+            f"[Runtime] CUDA available: {torch.cuda.device_count()} GPU(s) | selected={GPU_IDS}"
+            + (" | multi_gpu=enabled" if USE_MULTI_GPU else " | multi_gpu=disabled")
+        )
+    else:
+        print("[Runtime] CUDA not available; training on CPU")
 
     if args.optuna_trials is not None:
         run_optuna_finetuning(args)

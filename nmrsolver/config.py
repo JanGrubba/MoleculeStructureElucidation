@@ -184,7 +184,7 @@ class TrainConfig:
     lr: float = 3e-4  # Learning rate. Min: 1e-6, Max: 1e-2.
     weight_decay: float = 1e-2  # L2 regularization strength. Min: 0.0, Max: 1.0.
     warmup_steps: int = 4000  # Steps to linearly increase LR. Min: 0, Max: 10,000+.
-    max_epochs: int = 5  # Maximum training epochs. Min: 1, Max: 1000+.
+    max_epochs: int = 10  # Maximum training epochs. Min: 1, Max: 1000+.
     grad_clip: float = 1.0  # Maximum gradient norm. Min: 0.0, Max: 10.0+.
     label_smoothing: float = 0.1  # Smoothing for target labels. Min: 0.0, Max: 0.2.
     val_fraction: float = 0.05  # Fraction of data for validation. Min: 0.0, Max: 0.5.
