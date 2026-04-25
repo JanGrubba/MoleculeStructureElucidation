@@ -14,7 +14,7 @@ from typing import Any
 #  DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
-DB_PATH = "/home/vqire/Downloads/nmrexp_no_spectra.db"
+DB_PATH = "C:/Users/Jan/Documents/MoleculeSolver/Databases/nmrexp_no_spectra.db"
 TABLE_NAME = "nmr_data"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -24,7 +24,9 @@ TABLE_NAME = "nmr_data"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 INDEX_DIR = os.path.join(PROJECT_ROOT, "indexes")
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+# Place logs inside the `nmrsolver` package directory rather than the project root
+# This creates a logs/ folder one level lower (i.e., nmrsolver/logs)
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SPECTRUM TOKENISATION

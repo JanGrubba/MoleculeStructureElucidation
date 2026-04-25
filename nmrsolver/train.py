@@ -18,6 +18,7 @@ import json
 import math
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -34,8 +35,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DistributedSampler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from . import config as C
 from .data import (
@@ -48,6 +48,14 @@ from .data import (
     make_dataloaders,
 )
 from .models import ForwardModel, InverseModel
+
+# Ensure stdout/stderr use UTF-8 on Windows consoles to avoid UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    # Older Python runtimes or some environments may not support reconfigure; ignore failures
+    pass
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Utilities
@@ -470,8 +478,12 @@ def train_inverse(
 
     optimizer = AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
     scheduler = LambdaLR(optimizer, get_lr_lambda(tcfg.warmup_steps))
+    # The inverse decoder becomes numerically unstable under CUDA fp16 autocast
+    # and can emit non-finite logits/CE losses on otherwise valid batches.
+    inverse_amp_enabled = False
     scaler = GradScaler(
-        device="cuda" if DEVICE.type == "cuda" else "cpu", enabled=DEVICE.type == "cuda"
+        device="cuda" if DEVICE.type == "cuda" else "cpu",
+        enabled=inverse_amp_enabled,
     )
 
     criterion = nn.CrossEntropyLoss(
@@ -553,7 +565,7 @@ def train_inverse(
             optimizer.zero_grad()
             with autocast(
                 device_type="cuda" if DEVICE.type == "cuda" else "cpu",
-                enabled=(DEVICE.type == "cuda"),
+                enabled=inverse_amp_enabled,
             ):
                 logits = model(spec, spec_mask, gf, formula_vec, tgt_in)
                 ce_loss = criterion(
@@ -624,7 +636,7 @@ def train_inverse(
                     valid_idx_t = torch.tensor(valid_rl_indices, device=DEVICE)
                     with autocast(
                         device_type="cuda" if DEVICE.type == "cuda" else "cpu",
-                        enabled=(DEVICE.type == "cuda"),
+                        enabled=inverse_amp_enabled,
                     ):
                         log_probs = F.log_softmax(logits[valid_idx_t], dim=-1)
                         # Clamp generated to valid range for gathering
@@ -865,7 +877,7 @@ def evaluate_inverse(
 
         with autocast(
             device_type="cuda" if DEVICE.type == "cuda" else "cpu",
-            enabled=(DEVICE.type == "cuda"),
+            enabled=False,
         ):
             logits = model(spec, spec_mask, gf, formula_vec, tgt_in)
             loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))

@@ -1,0 +1,53 @@
+[project]
+name = "molecule_solver_models"
+version = "0.0.1"
+description = "Machine Learning models powering the NMR analysis platform"
+readme = "README.md"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "accelerate>=1.12.0",
+    "matplotlib>=3.10.7",
+    "mlflow>=3.6.0",
+    "numpy<2.3",
+    "optuna>=4.6.0",
+    "optuna-integration>=4.6.0",
+    "rdkit>=2025.9.1",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.16.3",
+    "seaborn>=0.13.2",
+    "selfies>=2.2.0",
+    "torch>=2.11.0",
+    "torch-geometric>=2.7.0",
+    "torchaudio>=2.11.0",
+    "torchinfo>=1.8.0",
+    "torchvision>=0.26.0",
+    "xgboost>=3.1.2",
+    "zarr>=3.1.5",
+]
+
+[tool.uv]
+package = true
+
+#[build-system]
+#requires = ["uv_build>=0.9.11,<0.10.0"]
+#build-backend = "uv_build"
+
+[project.scripts]
+bh = "bh_main:start"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu130"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"] # E=Error, F=Pyflakes, I=Isort (import sorting)
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "pre-commit>=4.5.0",
+    "ruff>=0.14.6",
+]

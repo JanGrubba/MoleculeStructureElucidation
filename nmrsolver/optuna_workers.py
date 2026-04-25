@@ -161,6 +161,10 @@ def main() -> None:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = gpu_id
             env["PYTHONUNBUFFERED"] = "1"
+            # Ensure child processes use UTF-8 for IO to avoid UnicodeEncodeError
+            env["PYTHONIOENCODING"] = "utf-8"
+            # Also enable the UTF-8 mode for interpreters that support it
+            env["PYTHONUTF8"] = "1"
             command = _build_worker_command(args, worker_trials)
             log_path = launcher_log_dir / f"worker_{worker_idx:02d}_gpu_{gpu_id}.log"
             log_handle = log_path.open("wb")
