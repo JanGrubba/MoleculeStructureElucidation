@@ -7,7 +7,13 @@ import sys
 import time
 from pathlib import Path
 
-from . import config as C
+try:
+    from nmrsolver import config as C
+except Exception:
+    try:
+        from . import config as C
+    except Exception:
+        import config as C
 
 
 def _default_storage(study_name: str) -> str:
@@ -150,6 +156,20 @@ def main() -> None:
     print(f"[Launcher] GPUs: {gpu_ids[:worker_count]}")
     print(f"[Launcher] Trial split: {per_worker_trials}")
     print(f"[Launcher] Logs: {launcher_log_dir}")
+
+    # Initialize Optuna storage and create the study from the launcher process
+    # to avoid concurrent Alembic/DB migrations when multiple workers start.
+    try:
+        import optuna
+
+        print("[Launcher] Initializing Optuna storage and study (parent process)...")
+        optuna.create_study(
+            study_name=args.study_name, storage=args.storage, load_if_exists=True
+        )
+        print("[Launcher] Optuna study ready")
+    except Exception as e:
+        # Log and continue; workers will still attempt to use the storage.
+        print(f"[Launcher] Warning: failed to pre-initialize Optuna study: {e}")
 
     try:
         for worker_idx in range(worker_count):

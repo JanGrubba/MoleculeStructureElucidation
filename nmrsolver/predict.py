@@ -37,18 +37,63 @@ import torch
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
-from . import config as C
-from .data import (
-    SelfiesVocab,
-    collate_fn,
-    encode_formula_vector,
-    encode_global_features,
-    encode_spectrum,
-    load_rows,
-)
-from .models import ForwardModel, InverseModel
-from .retrieval import RetrievalIndex, spectrum_to_vector
-from .scoring import ScoredCandidate, rank_candidates, score_candidate
+# Robust package-relative imports
+try:
+    from nmrsolver import config as C
+except Exception:
+    try:
+        from . import config as C
+    except Exception:
+        import config as C
+
+try:
+    from nmrsolver import data as _data_mod
+except Exception:
+    try:
+        from . import data as _data_mod
+    except Exception:
+        import data as _data_mod
+
+SelfiesVocab = _data_mod.SelfiesVocab
+collate_fn = _data_mod.collate_fn
+encode_formula_vector = _data_mod.encode_formula_vector
+encode_global_features = _data_mod.encode_global_features
+encode_spectrum = _data_mod.encode_spectrum
+load_rows = _data_mod.load_rows
+
+try:
+    from nmrsolver import models as _models_mod
+except Exception:
+    try:
+        from . import models as _models_mod
+    except Exception:
+        import models as _models_mod
+
+ForwardModel = _models_mod.ForwardModel
+InverseModel = _models_mod.InverseModel
+
+try:
+    from nmrsolver import retrieval as _retrieval_mod
+except Exception:
+    try:
+        from . import retrieval as _retrieval_mod
+    except Exception:
+        import retrieval as _retrieval_mod
+
+RetrievalIndex = _retrieval_mod.RetrievalIndex
+spectrum_to_vector = _retrieval_mod.spectrum_to_vector
+
+try:
+    from nmrsolver import scoring as _scoring_mod
+except Exception:
+    try:
+        from . import scoring as _scoring_mod
+    except Exception:
+        import scoring as _scoring_mod
+
+ScoredCandidate = _scoring_mod.ScoredCandidate
+rank_candidates = _scoring_mod.rank_candidates
+score_candidate = _scoring_mod.score_candidate
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

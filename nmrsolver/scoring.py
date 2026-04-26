@@ -22,8 +22,23 @@ import numpy as np
 import selfies as sf
 from rdkit import Chem
 
-from . import config as C
-from .retrieval import spectrum_to_vector
+try:
+    from nmrsolver import config as C
+except Exception:
+    try:
+        from . import config as C
+    except Exception:
+        import config as C
+
+try:
+    from nmrsolver import retrieval as _retrieval_mod
+except Exception:
+    try:
+        from . import retrieval as _retrieval_mod
+    except Exception:
+        import retrieval as _retrieval_mod
+
+spectrum_to_vector = _retrieval_mod.spectrum_to_vector
 
 
 # ──────────────────────────────────────────────────────────────────────────────

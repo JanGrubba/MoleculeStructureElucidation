@@ -38,7 +38,13 @@ from torch.utils.data import (
     random_split,
 )
 
-from . import config as C
+try:
+    from nmrsolver import config as C
+except Exception:
+    try:
+        from . import config as C
+    except Exception:
+        import config as C
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  1. SQLite loading

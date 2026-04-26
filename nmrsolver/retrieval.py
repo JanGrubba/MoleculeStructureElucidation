@@ -26,7 +26,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import faiss
 import numpy as np
 
-from . import config as C
+try:
+    from nmrsolver import config as C
+except Exception:
+    try:
+        from . import config as C
+    except Exception:
+        import config as C
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Spectrum → fixed vector  (no learned parameters)

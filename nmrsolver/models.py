@@ -17,7 +17,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import config as C
+try:
+    from nmrsolver import config as C
+except Exception:
+    try:
+        from . import config as C
+    except Exception:
+        import config as C
 
 
 def _causal_bool_mask(size: int, device: torch.device | None = None) -> torch.Tensor:

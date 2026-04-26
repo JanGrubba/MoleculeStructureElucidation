@@ -37,17 +37,48 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 
-from . import config as C
-from .data import (
-    NMRDataset,
-    SelfiesVocab,
-    collate_fn,
-    encode_formula_vector,
-    encode_spectrum,
-    load_rows,
-    make_dataloaders,
-)
-from .models import ForwardModel, InverseModel
+# Ensure package imports work whether this file is executed as a module
+# (`python -m nmrsolver.train`) or as a script (`python nmrsolver/train.py`).
+# Prefer the absolute package import, fall back to relative or local import.
+_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PKG_ROOT not in sys.path:
+    sys.path.insert(0, _PKG_ROOT)
+
+try:
+    from nmrsolver import config as C
+except Exception:
+    try:
+        from . import config as C
+    except Exception:
+        import config as C
+# Robust imports for package modules (works when run as a module or script).
+try:
+    from nmrsolver import data as _data_mod
+except Exception:
+    try:
+        from . import data as _data_mod
+    except Exception:
+        import data as _data_mod
+
+# Expose expected symbols from the data module
+NMRDataset = _data_mod.NMRDataset
+SelfiesVocab = _data_mod.SelfiesVocab
+collate_fn = _data_mod.collate_fn
+encode_formula_vector = _data_mod.encode_formula_vector
+encode_spectrum = _data_mod.encode_spectrum
+load_rows = _data_mod.load_rows
+make_dataloaders = _data_mod.make_dataloaders
+
+try:
+    from nmrsolver import models as _models_mod
+except Exception:
+    try:
+        from . import models as _models_mod
+    except Exception:
+        import models as _models_mod
+
+ForwardModel = _models_mod.ForwardModel
+InverseModel = _models_mod.InverseModel
 
 # Ensure stdout/stderr use UTF-8 on Windows consoles to avoid UnicodeEncodeError
 try:
